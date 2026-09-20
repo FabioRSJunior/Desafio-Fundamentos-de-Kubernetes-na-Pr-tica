@@ -688,3 +688,105 @@ qual a diferença prática entre liveness e readiness? Por que escalar a API par
 réplicas é seguro, mas escalar o banco desse jeito (com o mesmo PVC) não seria?
 
 A liveness probe detecta se o container travou e precisa ser reiniciado, enquanto a readiness probe detecta se o container está pronto para receber tráfego, removendo-o temporariamente dos Endpoints do Service caso não esteja, sem reiniciá-lo; escalar o PostgREST é seguro porque a API é stateless (todas as réplicas apenas consultam o mesmo Postgres, sem guardar dados próprios), mas escalar o Postgres com o mesmo PVC seria perigoso porque o banco é stateful e o volume (`ReadWriteOnce`) só pode ser escrito por um Pod por vez, então múltiplas réplicas escrevendo no mesmo diretório de dados corromperiam o banco.
+
+# Nível 7 — Escalonamento automático (bônus)
+
+Deixar a API escalar sozinha sob carga, Configure um Horizontal Pod Autoscaler (HPA) para a API, escalando conforme o uso de CPU. Gere carga com uma ferramenta de sua escolha e observe o cluster criar novos Pods automaticamente — e removê-los quando a carga cair.
+
+**Nível 7 — Horizontal Pod Autoscaler (HPA)**. O objetivo é fazer a API escalar sozinha conforme o uso de CPU sobe.
+
+**1. Habilitar o metrics-server no minikube**
+
+O HPA depende dele para saber o uso de CPU dos Pods. No minikube, é um addon:
+
+bash
+
+```bash
+minikube addons enable metrics-server
+```
+
+![image.png](images/image%2031.png)
+
+Confirme que ele subiu:
+
+```bash
+kubectl get pods -n kube-system | grep metrics-server
+```
+
+![image.png](images/image%2032.png)
+
+Espere até aparecer `Running`. 
+
+```bash
+kubectl top pods -n k8s-desafio
+```
+
+![image.png](images/image%2033.png)
+
+```bash
+kubectl autoscale deployment postgrest -n k8s-desafio --cpu-percent=50 --min=1 --max=5
+```
+
+![image.png](images/image%2034.png)
+
+Confirme que foi criado e que já está lendo métricas:
+
+```bash
+kubectl get hpa -n k8s-desafio
+```
+
+![image.png](images/image%2035.png)
+
+**Importante:** o HPA calcula a porcentagem em cima do `requests.cpu` que você já definiu no Deployment do Nível 6. Se esse valor estiver alto (ex: `100m` ou mais), pode ser difícil gerar carga suficiente para estourar 50%. Confira com:
+
+```bash
+kubectl describe pod -n k8s-desafio -l app=postgrest | grep -A 2 Requests
+```
+
+![image.png](images/image%2036.png)
+
+O problema mais comum aqui é que um loop simples de `curl` de fora do cluster não gera carga suficiente, porque cada requisição HTTP é rápida demais e o gargalo é a rede, não a CPU do Pod. O jeito mais confiável é rodar um Pod **dentro do cluster**, batendo direto no Service em loop apertado, sem pausa:
+
+```bash
+kubectl run carga -n k8s-desafio --image=busybox --restart=Never -- sh -c '
+for i in $(seq 1 20); do
+  (while true; do wget -q -O- http://postgrest-service/todos; done) &
+done
+wait'
+```
+
+Deixe rodando. Se depois de 1-2 minutos o CPU não subir o suficiente, suba a intensidade rodando esse mesmo comando em 2-3 terminais diferentes ao mesmo tempo, multiplicando a carga.Observar o escalonamento em tempo real
+
+```bash
+kubectl get hpa -n k8s-desafio -w
+```
+
+![image.png](images/image%2037.png)
+
+Você deve ver o `TARGETS` subir (ex: `65%/50%`) e o número em `REPLICAS` aumentar sozinho, de 1 para 2, 3, etc. Em paralelo, confira os Pods sendo criados:
+
+```bash
+kubectl get pods -n k8s-desafio -l app=postgrest -w
+```
+
+Ver ele escalar de volta
+
+Pare o Pod de carga (`Ctrl+C`, ele se autodeleta por causa do `--rm`). O HPA tem um período de estabilização (padrão 5 minutos) antes de reduzir réplicas, para evitar oscilação. Espere alguns minutos e rode de novo:
+
+bash
+
+```bash
+kubectl get hpa -n k8s-desafio -w
+```
+
+![image.png](images/image%2038.png)
+
+Você deve ver `REPLICAS` voltar gradualmente para `1`.
+
+![image.png](image%2039.png)
+
+kubectl get all -n k8s-desafio
+
+Com o HPA configurado e uma carga concorrente suficiente gerada (múltiplos loops de requisições simultâneas dentro de um Pod), o uso de CPU do PostgREST ultrapassou amplamente o limiar configurado, chegando a valores muito acima do alvo de 50%. Como consequência, o HPA disparou automaticamente o escalonamento, aumentando o número de réplicas do Deployment além do mínimo original, e novos Pods do PostgREST foram criados e entraram em estado `Running` para absorver a carga. Isso comprova que o Horizontal Pod Autoscaler está funcionando corretamente: ele monitora a métrica de CPU via metrics-server e ajusta o número de réplicas em tempo real conforme a demanda sobe, sem qualquer intervenção manual.
+
+
