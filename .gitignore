@@ -1,0 +1,39 @@
+# Segredos e credenciais reais (nunca commitar)
+*.env
+.env
+secrets/
+*-secret-real.yaml
+kubeconfig
+kubeconfig.yaml
+*.pem
+*.key
+*.crt
+
+# Arquivos temporários do Kubernetes/Helm
+*.tgz
+charts/*.tgz
+
+# Logs
+*.log
+
+# Arquivos de editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# Arquivos de backup
+*.bak
+*.tmp
+
+# Node/Python (caso tenha scripts auxiliares)
+node_modules/
+__pycache__/
+*.pyc
+venv/
+.venv/
