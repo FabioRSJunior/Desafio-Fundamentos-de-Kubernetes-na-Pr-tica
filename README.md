@@ -379,3 +379,136 @@ echo "Senha   : $(echo "YWRtaW4xMjM=" | base64 -d)"
 
 **Isso significa que um Secret do Kubernetes, por padrão, não protege as credenciais de quem tem acesso ao cluster. Qualquer pessoa com permissão de `get` sobre Secrets naquele namespace consegue ler as credenciais em texto puro com um comando trivial. Na prática, Secrets servem principalmente para *separar* dados sensíveis da definição da aplicação (evitando hardcode no YAML do Deployment) e para controlar o acesso via RBAC — mas não substituem uma solução real de segurança. Para proteção de verdade, seria necessário habilitar encryption at rest no etcd (armazenamento do cluster), usar uma ferramenta externa de gerenciamento de segredos (como HashiCorp Vault ou AWS Secrets Manager), e restringir rigorosamente via RBAC quem pode ler Secrets no namespace.**
 
+# Nível 4 — A API conectada ao banco (a integração)
+
+Subir o PostgREST apontando para o PostgreSQL, Implante a API (PostgREST) como um Deployment. Ela se configura por variáveis de ambiente — precisa da string de conexão com o banco, que deve apontar para o nome do Service do PostgreSQL (não um IP). Reaproveite o usuário e a senha do Secret do nível anterior. Crie uma tabela no banco e confirme que a API expõe essa tabela via HTTP.
+
+Primeiro foi criada uma tabela de exemplo no Postgres, já que o PostgREST expõe automaticamente qualquer tabela do banco como endpoint REST. Em seguida, foi criado o Deployment do PostgREST, configurado via variável de ambiente `PGRST_DB_URI` (a string de conexão), montada combinando as variáveis já existentes do Secret e do ConfigMap através da sintaxe `$(VAR)` do Kubernetes, o que evita repetir usuário e senha em texto puro. Essa string aponta para `postgres-service`, o nome do Service do Postgres, permitindo que o PostgREST encontre o banco via DNS interno do cluster, sem depender de IP. Por fim, foi criado um Service para o PostgREST, que já deixa a API pronta para ser exposta no Nível 5.
+
+**Criando a tabela de exemplo:**
+
+```jsx
+kubectl exec -it -n k8s-desafio deploy/postgres -- psql -U admin -d desafiodb
+```
+
+Dentro do `psql:`
+
+```jsx
+CREATE TABLE todos (
+  id SERIAL PRIMARY KEY,
+  tarefa TEXT NOT NULL,
+  feito BOOLEAN DEFAULT false
+);
+GRANT ALL ON todos TO admin;
+GRANT ALL ON SEQUENCE todos_id_seq TO admin;
+\q
+```
+
+![image.png](images/image%2014.png)
+
+1. Deployment do PostgREST (`04-postgrest-deployment.yaml`)
+
+```jsx
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgrest
+  namespace: k8s-desafio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgrest
+  template:
+    metadata:
+      labels:
+        app: postgrest
+    spec:
+      containers:
+        - name: postgrest
+          image: postgrest/postgrest:latest
+          ports:
+            - containerPort: 3000
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: POSTGRES_DB
+            - name: PGRST_DB_URI
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres-service:5432/$(POSTGRES_DB)"
+            - name: PGRST_DB_SCHEMA
+              value: "public"
+            - name: PGRST_DB_ANON_ROLE
+              value: "admin"
+```
+
+Dois pontos importantes nesse Deployment: `postgres-service` no `PGRST_DB_URI` é o nome do Service do Postgres, é assim que o PostgREST encontra o banco pelo DNS interno do cluster; e `PGRST_DB_ANON_ROLE` precisa ser um role que já tenha permissões no banco como foi dado `GRANT ALL` para `admin`, esse role foi reutilizado aqui (em produção o ideal seria criar um role dedicado, só de leitura/gravação restrita).
+
+**2. Service do PostgREST (`04-postgrest-service.yaml`)**
+
+```jsx
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgrest-service
+  namespace: k8s-desafio
+spec:
+  selector:
+    app: postgrest
+  ports:
+    - port: 80
+      targetPort: 3000
+```
+
+Aplicação dos manifests:
+
+```jsx
+kubectl apply -f 04-postgrest-deployment.yaml
+kubectl apply -f 04-postgrest-service.yaml
+```
+
+Verificação de que a API subiu corretamente:
+
+```jsx
+**kubectl get pods -n k8s-desafio
+kubectl logs -n k8s-desafio -l app=postgrest**
+```
+
+![image.png](images/image%2015.png)
+
+Teste da integração, ainda de dentro do cluster
+
+```jsx
+kubectl run curl-test --image=curlimages/curl -it --rm --restart=Never -n k8s-desafio -- curl http://postgrest-service/todos
+```
+
+**Testar a integração**
+
+```bash
+kubectl run curl-test --image=curlimages/curl -it --rm --restart=Never -n k8s-desafio -- curl http://postgrest-service/todos
+```
+
+Isso deve retornar `[]` (array vazio, já que a tabela `todos` ainda não tem dados) — se retornar isso, prova que a API achou o Postgres e leu a tabela com sucesso.
+
+![image.png](images/image%2016.png)
+
+Resultado
+
+ Os logs mostraram `Listening on port 3000`, confirmando que a API estava de pé e conectada ao banco. O teste de integração retornou `[]` (array vazio, já que a tabela `todos` ainda não tinha dados), o que prova três coisas ao mesmo tempo: a API PostgREST está no ar, ela conseguiu se conectar ao Postgres pelo nome do Service (DNS interno do cluster), e a tabela `todos` existe e está acessível.
+
+Reflita: por que usamos o nome do Service do Postgres na string de conexão, em vez do IP
+do Pod? O que aconteceria com a conexão se você usasse o IP e o Pod do banco fosse
+recriado?
+
+Usamos o nome do Service porque ele é um endereço estável, resolvido via DNS interno do cluster, enquanto o IP de um Pod é dinâmico e pode mudar sempre que ele é recriado (por crash, atualização ou remoção manual). Se a conexão apontasse diretamente para o IP do Pod, ela funcionaria até o Postgres ser recriado com um novo IP, e a partir daí o PostgREST continuaria tentando acessar o endereço antigo e falharia; o Service evita isso ao atuar como uma camada estável que redireciona o tráfego automaticamente para o Pod correto, não importa quantas vezes seu IP interno mude.
