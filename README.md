@@ -119,3 +119,129 @@ que raramente criamos Pods diretamente.
 
 **É exatamente por isso que raramente criamos Pods "nus" em produção: eles não se recuperam de falhas, reinícios de node ou remoções acidentais. Usar Deployments (ou outros controllers) é o que torna a aplicação resiliente e alinhada ao modelo declarativo do Kubernetes.**
 
+# Nível 2 — PostgreSQL com persistência
+
+Subir o PostgreSQL de forma que os dados sobrevivam. Implante o PostgreSQL no cluster. Ele precisa de armazenamento que não desapareça quando o Pod for recriado — pesquise como reservar armazenamento e montá-lo no diretório de dados do Postgres. Também precisa de um Service para que outros recursos consigam encontrá-lo pelo nome.
+
+Para este nível, foram criados três manifests YAML: um PersistentVolumeClaim para garantir que os dados do banco não se percam quando o Pod for recriado, um Deployment do PostgreSQL configurado com usuário e senha diretamente no YAML (etapa que será substituída por Secret no Nível 3) e um Service do tipo ClusterIP, que expõe o banco apenas dentro do cluster, permitindo que outros recursos o encontrem pelo nome em vez de por IP. No Deployment, vale destacar o uso do `subPath: postgres` no volumeMount, que evita um problema comum onde o Postgres reclama por já existir uma pasta `lost+found` na raiz do volume montado.
+
+1. PersistentVolumeClaim (`02-postgres-pvc.yaml`)
+
+```jsx
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: k8s-desafio
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+```
+
+2. Deployment do Postgres (`02-postgres-deployment.yaml`)
+
+```jsx
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: k8s-desafio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: "admin"
+            - name: POSTGRES_PASSWORD
+              value: "admin123"
+            - name: POSTGRES_DB
+              value: "desafiodb"
+          volumeMounts:
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data
+              subPath: postgres
+      volumes:
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: postgres-pvc
+```
+
+3. Service (`02-postgres-service.yaml`)
+
+```jsx
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-service
+  namespace: k8s-desafio
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+```
+
+Depois dos artefatos criados, precisamos aplicação dos três manifests:
+
+```jsx
+kubectl apply -f 02-postgres-pvc.yaml
+kubectl apply -f 02-postgres-deployment.yaml
+kubectl apply -f 02-postgres-service.yaml
+```
+
+Verificar
+
+```jsx
+# confirma se o namespace existe 
+kubectl get namespace k8s-desafio
+```
+
+![image.png](images/image%207.png)
+
+```jsx
+# Ver se o PVC foi criado e está "Bound" (vinculado a um volume):
+kubectl get pvc -n k8s-desafio
+```
+
+![image.png](images/image%208.png)
+
+```jsx
+# Ver se o Pod do Postgres está rodando:
+kubectl get pods -n k8s-desafio
+```
+
+![image.png](images/image%209.png)
+
+tudo certo, está running , 5. Teste real de conexão (o mais importante — confirma que o Postgres está de pé e aceitando conexões). Entre no próprio pod e rode um comando psql
+
+```jsx
+kubectl exec -it -n k8s-desafio deploy/postgres -- psql -U admin -d desafiodb -c "SELECT 1;"
+```
+
+![image.png](images/image%2010.png)
+
+Resultado
+
+Namespace ativo, PVC `Bound`, Pod do Postgres em `Running`, e o comando `SELECT 1;` retornou com sucesso, confirmando que o banco estava de pé e aceitando conexões.
+
+Reflita: qual a diferença entre montar um PVC e um emptyDir ? O que aconteceria com os
+dados em cada caso ao deletar o Pod? (Você vai provar isso no Nível 5.)
+
+**Um `emptyDir` é um volume que existe apenas enquanto o Pod estiver vivo naquele node: ele é criado junto com o Pod e apagado junto com ele. Se o Pod for deletado ou recriado, todos os dados armazenados nesse volume se perdem, já que o `emptyDir` não é um recurso independente do Pod ele é apenas um espaço temporário no disco do node atrelado ao ciclo de vida daquele Pod específico.. Já um PVC (PersistentVolumeClaim) é um recurso independente do Pod. Ele existe por conta própria no cluster e é apenas *montado* pelo Pod, não pertence a ele. Isso significa que, quando o Pod é deletado e um novo é recriado pelo Deployment, o novo Pod pode montar o mesmo PVC e continuar de onde os dados pararam — o armazenamento sobrevive independentemente do ciclo de vida do Pod. Na prática: se o Postgres estivesse usando um `emptyDir` e o Pod fosse deletado, todos os dados do banco seriam perdidos ao recriar o Pod. Como usamos um PVC, o mesmo dado inserido antes da recriação continua acessível depois.**
+
