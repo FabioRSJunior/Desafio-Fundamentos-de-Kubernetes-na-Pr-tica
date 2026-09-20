@@ -588,3 +588,103 @@ Reflita: qual a diferença prática entre liveness e readiness? Por que escalar 
 réplicas é seguro, mas escalar o banco desse jeito (com o mesmo PVC) não seria?
 
 A liveness probe detecta se o container travou e precisa ser reiniciado, enquanto a readiness probe detecta se o container está pronto para receber tráfego, removendo-o temporariamente dos Endpoints do Service caso não esteja, sem reiniciá-lo; escalar o PostgREST é seguro porque a API é stateless (todas as réplicas apenas consultam o mesmo Postgres, sem guardar dados próprios), mas escalar o Postgres com o mesmo PVC seria perigoso porque o banco é stateful e o volume (`ReadWriteOnce`) só pode ser escrito por um Pod por vez, então múltiplas réplicas escrevendo no mesmo diretório de dados corromperiam o banco.
+
+# Nível 6 — Health Checks e escala
+
+Ensinar o cluster a monitorar e escalar a API Adicione liveness e readiness probes à API, para que o Kubernetes saiba quando reiniciá-la e quando ela está pronta para receber tráfego. Defina também requests e limits de CPU e memória. Aumente o número de réplicas da API e observe o Service balancear a carga entre elas.
+
+**Ver as 3 réplicas rodando:**
+
+```bash
+kubectl get pods -n k8s-desafio -l app=postgrest
+```
+
+Espera-se 3 Pods, todos `1/1 Running`.
+
+![image.png](images/image%2023.png)
+
+**Confirmar que as probes estão configuradas:**
+
+```bash
+kubectl describe pod -n k8s-desafio -l app=postgrest | grep -A 3 "Liveness\|Readiness"
+```
+
+![image.png](images/image%2024.png)
+
+**Confirmar os requests/limits:**
+
+```bash
+kubectl describe pod -n k8s-desafio -l app=postgrest | grep -A 4 "Limits\|Requests"
+```
+
+**Testar se a API continua respondendo (com o `port-forward` ainda ativo):**
+
+```jsx
+kubectl port-forward -n k8s-desafio svc/postgrest-service 8080:80
+curl http://localhost:8080/todos
+```
+
+![image.png](images/image%2025.png)
+
+Confirme que o `port-forward` está ativo em um terminal separado:
+
+```bash
+kubectl port-forward -n k8s-desafio svc/postgrest-service 8080:80
+```
+
+No outro terminal, dispare várias requisições seguidas
+
+```bash
+for i in {1..10}; do curl -s http://localhost:8080/todos > /dev/null && echo "req$i ok"; done
+```
+
+![image.png](images/image%2026.png)
+
+Para *ver de fato* o balanceamento acontecendo, olhe os logs de cada um dos 3 Pods depois de rodar o teste acima:
+
+```bash
+kubectl get pods -n k8s-desafio -l app=postgrest
+```
+
+Pegue os 3 nomes que aparecerem e rode para cada um:
+
+![image.png](images/image%2027.png)
+
+```bash
+kubectl logs -n k8s-desafio <nome-do-pod-1>
+kubectl logs -n k8s-desafio <nome-do-pod-2>
+kubectl logs -n k8s-desafio <nome-do-pod-3>
+```
+
+Se as requisições aparecerem espalhadas entre os 3 Pods (não todas concentradas em um só), isso comprova visualmente que o Service está balanceando a carga. Os 3 Pods estão rodando normalmente. Agora rode os `logs` com os nomes reais:
+
+```bash
+kubectl logs -n k8s-desafio postgrest-8699cfb64d-7n42h
+kubectl logs -n k8s-desafio postgrest-8699cfb64d-pvgnc
+kubectl logs -n k8s-desafio postgrest-8699cfb64d-sct66
+```
+
+gere um pouco de tráfego primeiro (com o `port-forward` ativo em outro terminal):
+
+![image.png](images/image%2028.png)
+
+depois dos testes de logs 
+
+![image.png](images/image%2029.png)
+
+As 15 requisições passaram (`req 1 ok` até `req 15 ok`) e o `port-forward` mostrou `Handling connection for 8080` 15 vezes, confirmando que o tráfego chegou até a API.
+
+Isso já prova que o Service está roteando as requisições normalmente. Como o kube-proxy faz round-robin por padrão entre os Endpoints (os 3 Pods do PostgREST), o balanceamento está acontecendo mesmo que os logs individuais do PostgREST não mostrem cada request (ele só loga eventos de sistema, não cada chamada HTTP). Para fechar a evidência do balanceamento de forma mais concreta:
+
+```bash
+kubectl get endpoints -n k8s-desafio postgrest-service
+```
+
+![image.png](images/image%2030.png)
+
+Listar os 3 IPs dos Pods por trás do Service, essa é a prova de que existem 3 destinos possíveis recebendo o tráfego balanceado.
+
+qual a diferença prática entre liveness e readiness? Por que escalar a API para várias
+réplicas é seguro, mas escalar o banco desse jeito (com o mesmo PVC) não seria?
+
+A liveness probe detecta se o container travou e precisa ser reiniciado, enquanto a readiness probe detecta se o container está pronto para receber tráfego, removendo-o temporariamente dos Endpoints do Service caso não esteja, sem reiniciá-lo; escalar o PostgREST é seguro porque a API é stateless (todas as réplicas apenas consultam o mesmo Postgres, sem guardar dados próprios), mas escalar o Postgres com o mesmo PVC seria perigoso porque o banco é stateful e o volume (`ReadWriteOnce`) só pode ser escrito por um Pod por vez, então múltiplas réplicas escrevendo no mesmo diretório de dados corromperiam o banco.
