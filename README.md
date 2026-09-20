@@ -512,3 +512,79 @@ do Pod? O que aconteceria com a conexão se você usasse o IP e o Pod do banco f
 recriado?
 
 Usamos o nome do Service porque ele é um endereço estável, resolvido via DNS interno do cluster, enquanto o IP de um Pod é dinâmico e pode mudar sempre que ele é recriado (por crash, atualização ou remoção manual). Se a conexão apontasse diretamente para o IP do Pod, ela funcionaria até o Postgres ser recriado com um novo IP, e a partir daí o PostgREST continuaria tentando acessar o endereço antigo e falharia; o Service evita isso ao atuar como uma camada estável que redireciona o tráfego automaticamente para o Pod correto, não importa quantas vezes seu IP interno mude.
+
+# Nível 5 — Expor a API e provar a persistência (o coração do desafio)
+
+Acessar a API de fora e garantir que os dados não somem Exponha a API para você conseguir acessá-la da sua máquina. Faça uma requisição que insira um dado através da API e outra que leia esse dado de volta. Em seguida, delete o Pod do PostgreSQL, espere o cluster recriá-lo, e consulte a API novamente.
+
+O critério de sucesso deste nível: o dado inserido antes de deletar o Pod do banco
+ainda deve estar acessível pela API depois da recriação. Se sumiu, seu volume não
+está persistindo — revise o Nível 2.
+
+Para expor a API, foi usado `kubectl port-forward` diretamente no Service, redirecionando a porta local 8080 para a porta 80 do `postgrest-service`. Com o `port-forward` ativo em um terminal, um dado foi inserido via `POST` e lido de volta via `GET` em outro terminal, confirmando que a API estava acessível de fora do cluster. Em seguida veio o teste central do desafio: o Pod do Postgres foi deletado manualmente, e como ele é gerenciado por um Deployment, o Kubernetes o recriou automaticamente. Depois da recriação, a API foi consultada novamente e o dado inserido anteriormente continuava lá, comprovando que o PVC realmente persiste os dados independente do ciclo de vida do Pod.
+
+```jsx
+kubectl port-forward -n k8s-desafio svc/postgrest-service 8080:80
+```
+
+Confirmando que está exposta e funcionando:
+
+```jsx
+curl http://localhost:8080/todos
+```
+
+![image.png](images/image%2017.png)
+
+**1. Inserindo um dado via POST:**
+
+```jsx
+curl -X POST http://localhost:8080/todos \
+  -H "Content-Type: application/json" \
+  -d '{"tarefa": "Aprender Kubernetes", "feito": false}'
+```
+
+![image.png](images/image%2018.png)
+
+2. Lendo o dado de volta via GET:
+
+```jsx
+curl http://localhost:8080/todos
+```
+
+![image.png](images/image%2019.png)
+
+3. Provando a persistência, deletando o Pod do Postgres:
+
+```jsx
+kubectl delete pod -n k8s-desafio -l app=postgres
+```
+
+![image.png](images/image%2020.png)
+
+**Aguardando o Kubernetes recriar o Pod automaticamente:**
+
+```jsx
+kubectl get pods -n k8s-desafio -w
+```
+
+![image.png](images/image%2021.png)
+
+Consultando a API novamente após a recriação:
+
+```jsx
+curl http://localhost:8080/todos
+```
+
+Se o dado que você inseriu no passo 1 **ainda estiver lá**, você provou que:
+
+- O volume (PVC) realmente persiste os dados, independente do Pod
+- Toda a cadeia (PVC → Deployment → Service → API) está coordenada corretamente
+
+![image.png](images/image%2022.png)
+
+Resultado:  O dado inserido no passo 1 (`"Aprender Kubernetes"`) continuou acessível pela API mesmo depois da recriação do Pod do Postgres, com o `id` gerado automaticamente preservado. Isso comprova que o volume (PVC) realmente persiste os dados de forma independente do Pod, e que toda a cadeia PVC → Deployment → Service → API está coordenada corretamente. Isso fecha o Nível 5.
+
+Reflita: qual a diferença prática entre liveness e readiness? Por que escalar a API para várias
+réplicas é seguro, mas escalar o banco desse jeito (com o mesmo PVC) não seria?
+
+A liveness probe detecta se o container travou e precisa ser reiniciado, enquanto a readiness probe detecta se o container está pronto para receber tráfego, removendo-o temporariamente dos Endpoints do Service caso não esteja, sem reiniciá-lo; escalar o PostgREST é seguro porque a API é stateless (todas as réplicas apenas consultam o mesmo Postgres, sem guardar dados próprios), mas escalar o Postgres com o mesmo PVC seria perigoso porque o banco é stateful e o volume (`ReadWriteOnce`) só pode ser escrito por um Pod por vez, então múltiplas réplicas escrevendo no mesmo diretório de dados corromperiam o banco.
