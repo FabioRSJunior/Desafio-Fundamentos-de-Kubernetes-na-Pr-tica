@@ -697,11 +697,7 @@ A liveness probe detecta se o container travou e precisa ser reiniciado, enquant
 
 Deixar a API escalar sozinha sob carga, Configure um Horizontal Pod Autoscaler (HPA) para a API, escalando conforme o uso de CPU. Gere carga com uma ferramenta de sua escolha e observe o cluster criar novos Pods automaticamente — e removê-los quando a carga cair.
 
-**Nível 7 — Horizontal Pod Autoscaler (HPA)**. O objetivo é fazer a API escalar sozinha conforme o uso de CPU sobe.
-
-**1. Habilitar o metrics-server no minikube**
-
-O HPA depende dele para saber o uso de CPU dos Pods. No minikube, é um addon:
+Habilitar o metrics-server no minikube, O HPA depende dele para saber o uso de CPU dos Pods. No minikube, é um addon:
 
 bash
 
@@ -789,7 +785,10 @@ Você deve ver `REPLICAS` voltar gradualmente para `1`.
 
 ![image.png](images/image%2039.png)
 
+
+```bash
 kubectl get all -n k8s-desafio
+```
 
 Com o HPA configurado e uma carga concorrente suficiente gerada (múltiplos loops de requisições simultâneas dentro de um Pod), o uso de CPU do PostgREST ultrapassou amplamente o limiar configurado, chegando a valores muito acima do alvo de 50%. Como consequência, o HPA disparou automaticamente o escalonamento, aumentando o número de réplicas do Deployment além do mínimo original, e novos Pods do PostgREST foram criados e entraram em estado `Running` para absorver a carga. Isso comprova que o Horizontal Pod Autoscaler está funcionando corretamente: ele monitora a métrica de CPU via metrics-server e ajusta o número de réplicas em tempo real conforme a demanda sobe, sem qualquer intervenção manual.
 
