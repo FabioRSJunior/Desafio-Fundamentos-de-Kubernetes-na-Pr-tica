@@ -245,3 +245,137 @@ dados em cada caso ao deletar o Pod? (Você vai provar isso no Nível 5.)
 
 **Um `emptyDir` é um volume que existe apenas enquanto o Pod estiver vivo naquele node: ele é criado junto com o Pod e apagado junto com ele. Se o Pod for deletado ou recriado, todos os dados armazenados nesse volume se perdem, já que o `emptyDir` não é um recurso independente do Pod ele é apenas um espaço temporário no disco do node atrelado ao ciclo de vida daquele Pod específico.. Já um PVC (PersistentVolumeClaim) é um recurso independente do Pod. Ele existe por conta própria no cluster e é apenas *montado* pelo Pod, não pertence a ele. Isso significa que, quando o Pod é deletado e um novo é recriado pelo Deployment, o novo Pod pode montar o mesmo PVC e continuar de onde os dados pararam — o armazenamento sobrevive independentemente do ciclo de vida do Pod. Na prática: se o Postgres estivesse usando um `emptyDir` e o Pod fosse deletado, todos os dados do banco seriam perdidos ao recriar o Pod. Como usamos um PVC, o mesmo dado inserido antes da recriação continua acessível depois.**
 
+# Nível 3 — Configuração e segredos
+
+Externalizar config e proteger as credenciais do banco, As credenciais do PostgreSQL (usuário e senha) não podem estar escritas dentro do YAML do Deployment. Mova-as para um Secret e injete no container do banco. Coloque também alguma configuração não sensível em um ConfigMap. Esse mesmo Secret será reutilizado pela API no próximo nível.
+
+Para este nível, as credenciais do Postgres (usuário e senha) foram removidas do Deployment e movidas para um Secret, enquanto a configuração não sensível (o nome do banco) foi movida para um ConfigMap. O Deployment foi então atualizado para puxar essas variáveis via `valueFrom` (`secretKeyRef` e `configMapKeyRef`) em vez de valores fixos no YAML. Como o Kubernetes exige que os dados de um Secret estejam codificados em base64, os valores de usuário e senha foram convertidos antes de montar o arquivo.
+
+```jsx
+#Gerando os valores em base64:
+
+echo -n "admin" | base64
+echo -n "admin123" | base64
+
+YWRtaW4=
+YWRtaW4xMjM=
+```
+
+1. Secret (`03-postgres-secret.yaml`)
+
+```jsx
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secret
+  namespace: k8s-desafio
+type: Opaque
+data:
+  POSTGRES_USER: YWRtaW4=
+  POSTGRES_PASSWORD: YWRtaW4xMjM=
+```
+
+2. ConfigMap (`03-postgres-configmap.yaml`)
+
+```jsx
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+  namespace: k8s-desafio
+data:
+  POSTGRES_DB: "desafiodb"
+```
+
+3. Deployment atualizado (`03-postgres-deployment.yaml`)
+
+```jsx
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: k8s-desafio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: POSTGRES_DB
+          volumeMounts:
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data
+              subPath: postgres
+      volumes:
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: postgres-pvc
+```
+
+Aplicação dos três manifests:
+
+```jsx
+kubectl apply -f 03-postgres-secret.yaml
+kubectl apply -f 03-postgres-configmap.yaml
+kubectl apply -f 03-postgres-deployment.yaml
+```
+
+Verificação de que o Pod foi recriado e de que as variáveis de ambiente vieram corretamente do Secret e do ConfigMap:
+
+```jsx
+kubectl get pods -n k8s-desafio
+kubectl exec -it -n k8s-desafio deploy/postgres -- env | grep POSTGRES
+```
+
+![image.png](images/image%2011.png)
+
+Resultado
+
+O comando `env` confirmou os valores corretos de `POSTGRES_USER`, `POSTGRES_PASSWORD` e `POSTGRES_DB`, comprovando que vieram do Secret e do ConfigMap em vez de estarem hardcoded no Deployment.
+
+Um ponto de atenção observado: como a mudança de `value` fixo para `valueFrom` altera a especificação do Deployment, o Kubernetes recriou o Pod do Postgres automaticamente. Como o volume é persistente (PVC), os dados que já estavam lá continuaram intactos. Vale notar que, se usuário e senha fossem alterados para valores diferentes dos originais nessa troca, o Postgres não recriaria o usuário automaticamente — a inicialização do usuário só roda na primeira vez que o volume é criado. Como neste caso os valores permaneceram os mesmos (`admin`/`admin123`), não houve problema.
+
+Reflita: ao inspecionar o Secret com -o yaml , o valor aparece "embaralhado". Isso é
+criptografia de verdade ou apenas codificação? O que isso significa para a segurança real?
+
+```jsx
+kubectl get secret postgres-secret -n k8s-desafio -o yaml
+```
+
+![image.png](images/image%2012.png)
+
+```jsx
+echo "Usuário : $(echo "YWRtaW4=" | base64 -d)"
+echo "Senha   : $(echo "YWRtaW4xMjM=" | base64 -d)"
+```
+
+![image.png](images/image%2013.png)
+
+**Não é criptografia de verdade, é apenas codificação em base64. A diferença é fundamental: criptografia exige uma chave secreta para reverter o processo (sem a chave, o dado original é irrecuperável), enquanto base64 é uma codificação reversível por qualquer pessoa, sem senha nenhuma — como mostrado acima, basta rodar `base64 -d` para obter o valor original de volta.**
+
+**Isso significa que um Secret do Kubernetes, por padrão, não protege as credenciais de quem tem acesso ao cluster. Qualquer pessoa com permissão de `get` sobre Secrets naquele namespace consegue ler as credenciais em texto puro com um comando trivial. Na prática, Secrets servem principalmente para *separar* dados sensíveis da definição da aplicação (evitando hardcode no YAML do Deployment) e para controlar o acesso via RBAC — mas não substituem uma solução real de segurança. Para proteção de verdade, seria necessário habilitar encryption at rest no etcd (armazenamento do cluster), usar uma ferramenta externa de gerenciamento de segredos (como HashiCorp Vault ou AWS Secrets Manager), e restringir rigorosamente via RBAC quem pode ler Secrets no namespace.**
+
