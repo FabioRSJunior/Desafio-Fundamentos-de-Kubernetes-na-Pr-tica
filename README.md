@@ -24,6 +24,10 @@ manifests/
 └── 04-postgrest-service.yaml
 ```
 
+
+![image.png](images/image40.png)
+
+
 O prefixo numérico indica o nível do desafio em que cada arquivo foi criado ou atualizado, permitindo aplicar o projeto inteiro na ordem correta.
 
 Ferramenta usada: Minikube (driver Docker)
@@ -783,7 +787,7 @@ kubectl get hpa -n k8s-desafio -w
 
 Você deve ver `REPLICAS` voltar gradualmente para `1`.
 
-![image.png](image%2039.png)
+![image.png](images/image%2039.png)
 
 kubectl get all -n k8s-desafio
 
